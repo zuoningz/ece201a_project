@@ -1653,7 +1653,40 @@ def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_na
         
         is_repeat = is_repeat # False # False # True if the simulation is repeated with different powers, False if only one simulation is run.
         results = simulator_simulate(boxes, bonding_box_list, TIM_boxes, heatsink_obj = heatsink_obj, heatsink_list = heatsink_list, heatsink_name = heatsink_name, bonding_list = bonding_list, bonding_name_type_dict = bonding_name_type_dict, is_repeat = is_repeat,  min_TIM_height = min_TIM_height, power_dict = power_dict, anemoi_parameter_ID = anemoi_parameter_ID, layers = layers) #
+        print("\n===== DEBUG: OBJECT STRUCTURES =====")
+
+
+        if boxes:
+            print("\nBOX example:")
+            print(type(boxes[0]))
+            print(vars(boxes[0]))
+
+        if bonding_box_list:
+            print("\nBONDING BOX example:")
+            print(type(bonding_box_list[0]))
+            print(vars(bonding_box_list[0]))
+
+        if TIM_boxes:
+            print("\nTIM BOX example:")
+            print(type(TIM_boxes[0]))
+            print(vars(TIM_boxes[0]))
+
+        if heatsink_obj:
+            print("\nHEATSINK example:")
+            print(type(heatsink_obj))
+            print(heatsink_obj)
+
+        if layers:
+            print("\nLAYER example:")
+            print(type(layers[0]))
+            print(vars(layers[0]))
+
+        print("\n====================================\n")
         
+        print("Simulation results:")
+        for name, vals in results.items():
+            print(name, "->", vals)
+
         simulation_end_time = time.time()
         print("Simulation finished at ", simulation_end_time)
         print("Time taken for simulation: ", simulation_end_time - simulation_start_time)
@@ -1973,6 +2006,954 @@ def convert(source: Path, destination: Path, hbm_stack_height = 1) -> None:
         output_lines.pop()
 
     destination.write_text("\n".join(output_lines) + "\n")
+
+
+# ZUONING BEGIN
+
+# ============================================================
+# Fine-grained thermal solver for simulator_simulate()
+# Paste this ABOVE: if __name__ == '__main__': therm()
+# ============================================================
+
+from dataclasses import dataclass
+from collections import defaultdict
+
+try:
+    from scipy.sparse import lil_matrix, csr_matrix
+    from scipy.sparse.linalg import spsolve
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+AMBIENT_TEMP_C = 25.0
+EPS = 1e-18
+
+
+@dataclass
+class ThermalCell:
+    idx: int
+    i: int
+    j: int
+    k: int
+    x0: float
+    x1: float
+    y0: float
+    y1: float
+    z0: float
+    z1: float
+    dx_mm: float
+    dy_mm: float
+    dz_mm: float
+    center_x: float
+    center_y: float
+    center_z: float
+    owner_name: str
+    owner_box: object
+    k_eff: float
+    power_w: float
+    is_original_box: bool
+
+
+def mm_to_m(x_mm: float) -> float:
+    """
+    Convert millimeters to meters.
+    """
+    return x_mm * 1e-3
+
+
+def safe_float(x, default=None):
+    """
+    Try to convert x to float.
+    If it fails, return default.
+    """
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def dedup_sorted(values, tol=1e-9):
+    """
+    Sort values and remove duplicates (within tolerance).
+    """
+    if not values:
+        return []
+    values = sorted(values)
+    out = [values[0]]
+    for v in values[1:]:
+        if abs(v - out[-1]) > tol:
+            out.append(v)
+    return out
+
+
+def normalize_material_name(name: str) -> str:
+    """
+    Clean up a material/layer name string.
+    """
+    if name is None:
+        return ""
+    s = str(name).strip()
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def infer_material_from_name(name: str) -> str:
+    """
+    Guess a known material from a layer/material name.
+    """
+    if name is None:
+        return "Si"
+
+    n = normalize_material_name(name).lower()
+
+    if "epoxy, silver filled" in n or "epoxy silver filled" in n:
+        return "Epoxy, Silver filled"
+    if "epag" in n:
+        return "EpAg"
+    if "tim0p5" in n:
+        return "TIM0p5"
+    if "tim001" in n:
+        return "TIM001"
+    if "tim" in n:
+        return "TIM"
+    if "aln" in n:
+        return "AlN"
+    if "glass" in n:
+        return "Glass"
+    if "fr-4" in n or "fr4" in n or "pcb" in n:
+        return "FR-4"
+    if "air" in n:
+        return "Air"
+    if "aluminium" in n or "aluminum" in n:
+        return "Aluminium"
+    if "snpb" in n or "solder" in n or "bga" in n:
+        return "SnPb 67/37"
+    if "sio2" in n:
+        return "SiO2"
+    if "cu" in n or "copper" in n or "metal" in n:
+        return "Cu-Foil"
+    if "dummysi" in n:
+        return "Si"
+    if "silicon" in n or n == "si" or " active" in n or "interposer" in n or "substrate" in n or "wafer" in n:
+        return "Si"
+    if "infill" in n or "underfill" in n:
+        return "Infill_material"
+
+    return "Si"
+
+
+def material_to_k(material_name: str) -> float:
+    """
+    Convert material name to conductivity k.
+    """
+    if material_name in conductivity_values:
+        return float(conductivity_values[material_name])
+
+    inferred = infer_material_from_name(material_name)
+    if inferred in conductivity_values:
+        return float(conductivity_values[inferred])
+
+    return float(conductivity_values.get("Si", 105.0))
+
+
+def parse_material_effective_k(material_str: str) -> float:
+    """
+    Parse a material string and return effective conductivity.
+
+    Handles:
+      1) single material:
+         "Si"
+         "Cu-Foil"
+
+      2) mixture:
+         "Cu-Foil:0.5,Si:0.5"
+         "Cu-Foil:0.25,SiO2:0.75"
+         "Cu-Foil:0.1,FR-4:0.9"
+
+    Weighted average:
+        k_eff = sum(frac_i * k_i) / sum(frac_i)
+    """
+    if material_str is None or str(material_str).strip() == "":
+        return material_to_k("Si")
+
+    s = str(material_str).strip()
+
+    # protect commas inside names if needed
+    protected_map = {
+        "Epoxy, Silver filled": "Epoxy__Silver__filled"
+    }
+    for old, new in protected_map.items():
+        s = s.replace(old, new)
+
+    tokens = [tok.strip() for tok in s.split(",") if tok.strip()]
+    tokens = [tok.replace("Epoxy__Silver__filled", "Epoxy, Silver filled") for tok in tokens]
+
+    # If no ':' appears, treat as single material
+    if all(":" not in tok for tok in tokens):
+        return material_to_k(s)
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+
+    for tok in tokens:
+        parts = [p.strip() for p in tok.split(":")]
+
+        # mixture token should look like material:weight
+        if len(parts) == 2:
+            mat = parts[0]
+            frac = safe_float(parts[1], None)
+
+            if frac is None:
+                # fallback: interpret as single material
+                k_val = material_to_k(mat)
+                weighted_sum += k_val
+                weight_total += 1.0
+            else:
+                k_val = material_to_k(mat)
+                weighted_sum += frac * k_val
+                weight_total += frac
+
+        else:
+            # fallback
+            k_val = material_to_k(tok)
+            weighted_sum += k_val
+            weight_total += 1.0
+
+    if weight_total <= 0:
+        return material_to_k("Si")
+
+    return weighted_sum / weight_total
+
+def build_layer_lookup(layers):
+    """
+    Build:
+        layer_name -> {thickness, material, k}
+
+    This uses the layer objects passed into simulator_simulate().
+    """
+    lookup = {}
+
+    if layers is None:
+        return lookup
+
+    for layer in layers:
+        layer_name = None
+        if hasattr(layer, "get_name"):
+            layer_name = layer.get_name()
+        elif hasattr(layer, "name"):
+            layer_name = layer.name
+
+        if layer_name is None:
+            continue
+
+        thickness = None
+        if hasattr(layer, "get_thickness"):
+            thickness = safe_float(layer.get_thickness(), 0.0)
+        elif hasattr(layer, "thickness"):
+            thickness = safe_float(layer.thickness, 0.0)
+        else:
+            thickness = 0.0
+
+        material = None
+        if hasattr(layer, "get_material"):
+            material = layer.get_material()
+        elif hasattr(layer, "material"):
+            material = layer.material
+
+        if material is None or str(material).strip() == "":
+            material = infer_material_from_name(layer_name)
+
+        k_val = parse_material_effective_k(material)
+
+        lookup[str(layer_name)] = {
+            "thickness": float(thickness),
+            "material": material,
+            "k": float(k_val),
+        }
+
+    return lookup
+
+
+def parse_stackup_effective_k(stackup: str, layer_lookup: dict) -> float:
+    """
+    Compute effective conductivity k for one box.
+
+    Supports two styles:
+      1) layered stackup:
+         "1:5nm_GPU_active_3D,20:5nm_GPU_metal"
+
+      2) mixture stackup:
+         "1:Cu-Foil:60,Epoxy, Silver filled:40"
+
+    Uses weighted average k.
+    """
+    if stackup is None or str(stackup).strip() == "":
+        return material_to_k("Si")
+
+    s = str(stackup).strip()
+
+    # protect commas inside material names
+    protected_map = {
+        "Epoxy, Silver filled": "Epoxy__Silver__filled"
+    }
+    for old, new in protected_map.items():
+        s = s.replace(old, new)
+
+    raw_tokens = [tok.strip() for tok in s.split(",") if tok.strip()]
+    tokens = []
+    for tok in raw_tokens:
+        for old, new in protected_map.items():
+            tok = tok.replace(new, old)
+        tokens.append(tok)
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+
+    # detect likely mixture format
+    likely_mixture = False
+    for tok in tokens:
+        parts = [p.strip() for p in tok.split(":")]
+        if len(parts) >= 3:
+            last_num = safe_float(parts[-1], None)
+            if last_num is not None and 0.0 <= last_num <= 100.0:
+                likely_mixture = True
+
+    if likely_mixture:
+        for tok in tokens:
+            parts = [p.strip() for p in tok.split(":")]
+
+            if len(parts) == 2:
+                mat = parts[0]
+                frac = safe_float(parts[1], None)
+                if frac is None:
+                    continue
+                k_val = material_to_k(mat)
+                weighted_sum += frac * k_val
+                weight_total += frac
+
+            elif len(parts) >= 3:
+                mat = parts[-2]
+                frac = safe_float(parts[-1], None)
+                if frac is None:
+                    continue
+                k_val = material_to_k(mat)
+                weighted_sum += frac * k_val
+                weight_total += frac
+
+        if weight_total > 0:
+            return weighted_sum / weight_total
+
+    # layered interpretation
+    for tok in tokens:
+        parts = [p.strip() for p in tok.split(":")]
+
+        if len(parts) == 2:
+            count_str, layer_name = parts
+            count = safe_float(count_str, None)
+
+            if count is None:
+                # fallback
+                k_val = material_to_k(layer_name)
+                weighted_sum += 1.0 * k_val
+                weight_total += 1.0
+                continue
+
+            if layer_name in layer_lookup:
+                thickness = layer_lookup[layer_name]["thickness"]
+                k_val = layer_lookup[layer_name]["k"]
+            else:
+                thickness = 1.0
+                k_val = material_to_k(layer_name)
+
+            w = count * thickness
+            weighted_sum += w * k_val
+            weight_total += w
+
+        elif len(parts) >= 3:
+            # mixture-like token
+            count = safe_float(parts[0], None)
+            last_num = safe_float(parts[-1], None)
+
+            if count is not None and last_num is not None:
+                mat_name = parts[-2]
+                frac = last_num
+                k_val = material_to_k(mat_name)
+                weighted_sum += frac * k_val
+                weight_total += frac
+            else:
+                mat_name = parts[-1]
+                k_val = material_to_k(mat_name)
+                weighted_sum += 1.0 * k_val
+                weight_total += 1.0
+
+    if weight_total > 0:
+        return weighted_sum / weight_total
+
+    return material_to_k(infer_material_from_name(s))
+
+
+def make_heatsink_box(heatsink_obj):
+    """
+    Convert heatsink base into a Box.
+    We model the heatsink base as geometry.
+    Fin effect is captured by HTC boundary condition.
+    """
+    if heatsink_obj is None:
+        return None
+
+    x = float(heatsink_obj["x"])
+    y = float(heatsink_obj["y"])
+    z = float(heatsink_obj["z"])
+    dx = float(heatsink_obj["base_dx"])
+    dy = float(heatsink_obj["base_dy"])
+    dz = float(heatsink_obj["base_dz"])
+
+    if dz <= 1e-9:
+        dz = 0.1
+    material = heatsink_obj.get("material", "Cu-Foil")
+    name = heatsink_obj.get("name", "HS_top")
+
+    return Box(x, y, z, dx, dy, dz, 0.0, f"1:{material}", 0.0, name)
+
+
+def point_inside_box(cx, cy, cz, box, tol=1e-9):
+    """
+    Check whether point (cx, cy, cz) lies inside box.
+    """
+    return (
+        box.start_x - tol <= cx <= box.end_x + tol and
+        box.start_y - tol <= cy <= box.end_y + tol and
+        box.start_z - tol <= cz <= box.end_z + tol
+    )
+
+
+def find_owner_box(cx, cy, cz, solver_boxes):
+    """
+    Find the box that owns a voxel center.
+    If multiple boxes contain the point, choose the smallest-volume box.
+    """
+    candidates = []
+    for box in solver_boxes:
+        if point_inside_box(cx, cy, cz, box):
+            vol = max(box.width * box.length * box.height, EPS)
+            candidates.append((vol, box))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def build_axis_lines(solver_boxes, axis='x', pitch_mm=1.0):
+    """
+    Build sorted unique grid boundaries for one axis.
+    Includes:
+      - all box start/end coordinates
+      - regular pitch cuts
+    """
+    if axis == 'x':
+        starts = [b.start_x for b in solver_boxes]
+        ends = [b.end_x for b in solver_boxes]
+    elif axis == 'y':
+        starts = [b.start_y for b in solver_boxes]
+        ends = [b.end_y for b in solver_boxes]
+    elif axis == 'z':
+        starts = [b.start_z for b in solver_boxes]
+        ends = [b.end_z for b in solver_boxes]
+    else:
+        raise ValueError("axis must be x/y/z")
+
+    lo = min(starts)
+    hi = max(ends)
+
+    values = []
+    values.extend(starts)
+    values.extend(ends)
+
+    curr = math.floor(lo / pitch_mm) * pitch_mm
+    while curr <= hi + 1e-12:
+        values.append(round(curr, 9))
+        curr += pitch_mm
+
+    values.append(lo)
+    values.append(hi)
+
+    return dedup_sorted(values, tol=1e-9)
+
+
+def build_voxel_grid(
+    solver_boxes,
+    original_box_names,
+    layer_lookup,
+    xy_pitch_mm=1.0,
+    z_pitch_mm=0.1
+):
+    """
+    Build fine-grained voxel cells.
+
+    Each voxel:
+      - belongs to one owner box
+      - gets that box's effective k
+      - gets a fraction of that box's power
+    """
+    x_lines = build_axis_lines(solver_boxes, axis='x', pitch_mm=xy_pitch_mm)
+    y_lines = build_axis_lines(solver_boxes, axis='y', pitch_mm=xy_pitch_mm)
+    z_lines = build_axis_lines(solver_boxes, axis='z', pitch_mm=z_pitch_mm)
+
+    cells = []
+    cell_by_ijk = {}
+    cell_idx = 0
+
+    for i in range(len(x_lines) - 1):
+        x0 = x_lines[i]
+        x1 = x_lines[i + 1]
+        dx_mm = x1 - x0
+        if dx_mm <= 1e-12:
+            continue
+
+        for j in range(len(y_lines) - 1):
+            y0 = y_lines[j]
+            y1 = y_lines[j + 1]
+            dy_mm = y1 - y0
+            if dy_mm <= 1e-12:
+                continue
+
+            for k in range(len(z_lines) - 1):
+                z0 = z_lines[k]
+                z1 = z_lines[k + 1]
+                dz_mm = z1 - z0
+                if dz_mm <= 1e-12:
+                    continue
+
+                cx = 0.5 * (x0 + x1)
+                cy = 0.5 * (y0 + y1)
+                cz = 0.5 * (z0 + z1)
+
+                owner = find_owner_box(cx, cy, cz, solver_boxes)
+                if owner is None:
+                    continue
+
+                box_volume_m3 = max(
+                    mm_to_m(owner.width) * mm_to_m(owner.length) * mm_to_m(owner.height),
+                    EPS
+                )
+                cell_volume_m3 = max(
+                    mm_to_m(dx_mm) * mm_to_m(dy_mm) * mm_to_m(dz_mm),
+                    EPS
+                )
+
+                k_eff = parse_stackup_effective_k(owner.stackup, layer_lookup)
+
+                owner_power = 0.0 if owner.power is None else float(owner.power)
+                power_density = owner_power / box_volume_m3
+                cell_power = power_density * cell_volume_m3
+
+                is_original = owner.name in original_box_names
+
+                cell = ThermalCell(
+                    idx=cell_idx,
+                    i=i, j=j, k=k,
+                    x0=x0, x1=x1,
+                    y0=y0, y1=y1,
+                    z0=z0, z1=z1,
+                    dx_mm=dx_mm, dy_mm=dy_mm, dz_mm=dz_mm,
+                    center_x=cx, center_y=cy, center_z=cz,
+                    owner_name=owner.name,
+                    owner_box=owner,
+                    k_eff=float(k_eff),
+                    power_w=float(cell_power),
+                    is_original_box=is_original
+                )
+
+                cells.append(cell)
+                cell_by_ijk[(i, j, k)] = cell
+                cell_idx += 1
+
+    return cells, cell_by_ijk, x_lines, y_lines, z_lines
+
+
+def add_conduction_between_cells(G, cell_a: ThermalCell, cell_b: ThermalCell, axis: str):
+    """
+    Add conduction between two neighboring cells.
+
+    Resistance formula:
+        R = (L_a/2)/(k_a A) + (L_b/2)/(k_b A)
+
+    Then conductance:
+        g = 1/R
+    """
+    if axis == 'x':
+        area_m2 = mm_to_m(cell_a.dy_mm) * mm_to_m(cell_a.dz_mm)
+        La = 0.5 * mm_to_m(cell_a.dx_mm)
+        Lb = 0.5 * mm_to_m(cell_b.dx_mm)
+    elif axis == 'y':
+        area_m2 = mm_to_m(cell_a.dx_mm) * mm_to_m(cell_a.dz_mm)
+        La = 0.5 * mm_to_m(cell_a.dy_mm)
+        Lb = 0.5 * mm_to_m(cell_b.dy_mm)
+    elif axis == 'z':
+        area_m2 = mm_to_m(cell_a.dx_mm) * mm_to_m(cell_a.dy_mm)
+        La = 0.5 * mm_to_m(cell_a.dz_mm)
+        Lb = 0.5 * mm_to_m(cell_b.dz_mm)
+    else:
+        raise ValueError("axis must be x/y/z")
+
+    area_m2 = max(area_m2, EPS)
+    ka = max(cell_a.k_eff, EPS)
+    kb = max(cell_b.k_eff, EPS)
+
+    R = La / (ka * area_m2) + Lb / (kb * area_m2)
+    g = 1.0 / max(R, EPS)
+
+    ia = cell_a.idx
+    ib = cell_b.idx
+
+    G[ia, ia] += g
+    G[ib, ib] += g
+    G[ia, ib] -= g
+    G[ib, ia] -= g
+
+
+def add_convection_to_ambient(G, cell: ThermalCell, htc_w_m2k: float, face='top'):
+    """
+    Add convection from a cell face to ambient.
+
+    g = h * A
+    """
+    if face in ('top', 'bottom'):
+        area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
+    elif face == 'x':
+        area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
+    elif face == 'y':
+        area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
+    else:
+        raise ValueError("face must be top/bottom/x/y")
+
+    h = max(float(htc_w_m2k), 0.0)
+    area_m2 = max(area_m2, 0.0)
+
+    if h <= 0.0 or area_m2 <= 0.0:
+        return
+
+    g = h * area_m2
+    G[cell.idx, cell.idx] += g
+
+
+def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heatsink_obj=None):
+    """
+    Solve steady-state thermal system:
+        G * dT = P
+    where dT is temperature rise above ambient.
+    """
+    if num_cells == 0:
+        return np.array([])
+
+    use_sparse = SCIPY_AVAILABLE
+
+    if use_sparse:
+        G = lil_matrix((num_cells, num_cells), dtype=float)
+    else:
+        G = np.zeros((num_cells, num_cells), dtype=float)
+
+    P = np.zeros(num_cells, dtype=float)
+
+    for cell in cells:
+        P[cell.idx] = cell.power_w
+
+    # neighbor conduction
+    for cell in cells:
+        i, j, k = cell.i, cell.j, cell.k
+
+        nbr = cell_by_ijk.get((i + 1, j, k), None)
+        if nbr is not None:
+            add_conduction_between_cells(G, cell, nbr, 'x')
+
+        nbr = cell_by_ijk.get((i, j + 1, k), None)
+        if nbr is not None:
+            add_conduction_between_cells(G, cell, nbr, 'y')
+
+        nbr = cell_by_ijk.get((i, j, k + 1), None)
+        if nbr is not None:
+            add_conduction_between_cells(G, cell, nbr, 'z')
+
+    # convection from exposed top of heatsink
+    conv_count = 0
+    if heatsink_box is not None and heatsink_obj is not None:
+        htc = float(heatsink_obj.get("hc", 0.0))
+        bind_to_ambient = heatsink_obj.get("bound", True)
+
+        # if "bound" somehow came in as string, normalize it
+        if isinstance(bind_to_ambient, str):
+            bind_to_ambient = bind_to_ambient.strip().lower() == "true"
+
+        heatsink_cell_count = 0
+        top_heatsink_cell_count = 0
+
+        z_top = heatsink_box.end_z
+        tol = 1e-9
+
+        for cell in cells:
+            if cell.owner_name != heatsink_box.name:
+                continue
+
+            heatsink_cell_count += 1
+
+            if abs(cell.z1 - z_top) < tol:
+                if htc > 0.0:
+                    add_convection_to_ambient(G, cell, htc, face='top')
+                    conv_count += 1
+                    top_heatsink_cell_count += 1
+    else:
+        # fallback anchor if heatsink is absent
+        weak_h = 5.0
+        for cell in cells:
+            if cell_by_ijk.get((cell.i, cell.j, cell.k + 1), None) is None:
+                add_convection_to_ambient(G, cell, weak_h, face='top')
+
+    print("Heatsink voxel count =", heatsink_cell_count)
+    print("Top heatsink voxel count =", top_heatsink_cell_count)
+    print("Number of convection cells =", conv_count)
+    print("Heatsink name =", heatsink_box.name if heatsink_box is not None else None)
+    print("HTC =", heatsink_obj.get("hc") if heatsink_obj is not None else None)
+    # small numerical stabilization
+    for idx in range(num_cells):
+        G[idx, idx] += 1e-12
+
+    if use_sparse:
+        G = csr_matrix(G)
+        dT = spsolve(G, P)
+    else:
+        if num_cells > 3000:
+            raise RuntimeError(
+                "Grid too large for dense solve and scipy is unavailable. "
+                "Install scipy or use coarser grid."
+            )
+        dT = np.linalg.solve(G, P)
+
+    T = dT + AMBIENT_TEMP_C
+    return T
+
+
+def compute_box_directional_resistances(box, layer_lookup):
+    """
+    Compute simple directional thermal resistances for one original box:
+        Rx = Lx / (k A_yz)
+        Ry = Ly / (k A_xz)
+        Rz = Lz / (k A_xy)
+    """
+    k_eff = parse_stackup_effective_k(box.stackup, layer_lookup)
+    k_eff = max(k_eff, EPS)
+
+    wx = max(mm_to_m(box.width), EPS)
+    ly = max(mm_to_m(box.length), EPS)
+    hz = max(mm_to_m(box.height), EPS)
+
+    A_yz = max(ly * hz, EPS)
+    A_xz = max(wx * hz, EPS)
+    A_xy = max(wx * ly, EPS)
+
+    Rx = wx / (k_eff * A_yz)
+    Ry = ly / (k_eff * A_xz)
+    Rz = hz / (k_eff * A_xy)
+
+    return float(Rx), float(Ry), float(Rz)
+
+
+def aggregate_results(original_boxes, cells, temperatures, layer_lookup):
+    """
+    Aggregate voxel temperatures back to original input boxes only.
+
+    Returns:
+        {
+            box.name: (peak_temp, avg_temp, Rx, Ry, Rz)
+        }
+    """
+    cell_temps_by_owner = defaultdict(list)
+    cell_vols_by_owner = defaultdict(list)
+
+    for cell in cells:
+        if not cell.is_original_box:
+            continue
+        temp = float(temperatures[cell.idx])
+        vol = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
+        cell_temps_by_owner[cell.owner_name].append(temp)
+        cell_vols_by_owner[cell.owner_name].append(vol)
+
+    results = {}
+
+    for box in original_boxes:
+        temps = cell_temps_by_owner.get(box.name, [])
+        vols = cell_vols_by_owner.get(box.name, [])
+
+        if len(temps) == 0:
+            peak_temp = AMBIENT_TEMP_C
+            avg_temp = AMBIENT_TEMP_C
+        else:
+            peak_temp = max(temps)
+            vol_sum = max(sum(vols), EPS)
+            avg_temp = sum(t * v for t, v in zip(temps, vols)) / vol_sum
+
+        Rx, Ry, Rz = compute_box_directional_resistances(box, layer_lookup)
+
+        results[box.name] = (
+            float(peak_temp),
+            float(avg_temp),
+            float(Rx),
+            float(Ry),
+            float(Rz),
+        )
+
+    return results
+
+
+def simulator_simulate(
+    boxes,
+    bonding_box_list,
+    TIM_boxes,
+    heatsink_obj=None,
+    heatsink_list=None,
+    heatsink_name=None,
+    bonding_list=None,
+    bonding_name_type_dict=None,
+    is_repeat=False,
+    min_TIM_height=0.1,
+    power_dict=None,
+    anemoi_parameter_ID=None,
+    layers=None
+):
+    """
+    Fine-grained thermal simulation.
+
+    Inputs:
+      boxes            : original input boxes (the ones required by project output)
+      bonding_box_list : helper thermal boxes for bonding layers
+      TIM_boxes        : helper thermal boxes for TIM layers
+      heatsink_obj     : heatsink base geometry + HTC info
+      layers           : layer definitions used by stackup parsing
+
+    Output:
+      {
+        box.name: (peak_temp, avg_temp, Rx, Ry, Rz)
+      }
+    """
+
+    print("Entering simulator_simulate()")
+
+    # Grid resolution
+    # You can tune these if runtime is too high or too low.
+    XY_PITCH_MM = 1.0
+    Z_PITCH_MM = 0.1
+
+    original_boxes = list(boxes)
+    original_box_names = set(b.name for b in original_boxes)
+
+    solver_boxes = []
+    solver_boxes.extend(original_boxes)
+    solver_boxes.extend(bonding_box_list)
+    solver_boxes.extend(TIM_boxes)
+
+    heatsink_box = None
+    if heatsink_obj is not None:
+        heatsink_box = make_heatsink_box(heatsink_obj)
+        solver_boxes.append(heatsink_box)
+    
+    print("heatsink_obj =", heatsink_obj)
+    print("heatsink_box vars =", vars(heatsink_box))
+    print("heatsink start_z =", heatsink_box.start_z)
+    print("heatsink end_z   =", heatsink_box.end_z)
+    print("heatsink height  =", heatsink_box.height)
+    print("heatsink width   =", heatsink_box.width)
+    print("heatsink length  =", heatsink_box.length)
+
+    print("max original end_z =", max(b.end_z for b in boxes))
+    print("max solver end_z   =", max(b.end_z for b in solver_boxes))
+
+    
+    layer_lookup = build_layer_lookup(layers)
+    print(f"build_layer_lookup, layers= {layer_lookup }")
+    print("k_eff =", parse_stackup_effective_k(boxes[0].stackup, layer_lookup))
+
+    print(f"Original boxes      : {len(original_boxes)}")
+    print(f"Bonding boxes       : {len(bonding_box_list)}")
+    print(f"TIM boxes           : {len(TIM_boxes)}")
+    print(f"Solver boxes total  : {len(solver_boxes)}")
+    print(f"XY pitch (mm)       : {XY_PITCH_MM}")
+    print(f"Z pitch (mm)        : {Z_PITCH_MM}")
+    print(f"SciPy available     : {SCIPY_AVAILABLE}")
+
+    # Build voxel grid
+    t0 = time.time()
+    cells, cell_by_ijk, x_lines, y_lines, z_lines = build_voxel_grid(
+        solver_boxes=solver_boxes,
+        original_box_names=original_box_names,
+        layer_lookup=layer_lookup,
+        xy_pitch_mm=XY_PITCH_MM,
+        z_pitch_mm=Z_PITCH_MM
+    )
+    t1 = time.time()
+
+    if heatsink_box is not None:
+        heatsink_voxels = [c for c in cells if c.owner_name == heatsink_box.name]
+        print("Total heatsink voxels =", len(heatsink_voxels))
+
+        # print a few z-values near heatsink
+        print("heatsink z-range =", heatsink_box.start_z, heatsink_box.end_z)
+        z_near = [z for z in z_lines if heatsink_box.start_z - 0.2 <= z <= heatsink_box.end_z + 0.2]
+        print("z lines near heatsink =", z_near[:30])
+
+    print(f"Voxel cells built   : {len(cells)}")
+    print(f"Grid build time (s) : {t1 - t0:.3f}")
+    print("Total voxel power =", sum(c.power_w for c in cells))
+
+    # Solve temperatures
+    temperatures = solve_thermal_system(
+        num_cells=len(cells),
+        cells=cells,
+        cell_by_ijk=cell_by_ijk,
+        heatsink_box=heatsink_box,
+        heatsink_obj=heatsink_obj
+    )
+    t2 = time.time()
+
+    print(f"Solve time (s)      : {t2 - t1:.3f}")
+
+    # Aggregate back to original boxes only
+    results = aggregate_results(
+        original_boxes=original_boxes,
+        cells=cells,
+        temperatures=temperatures,
+        layer_lookup=layer_lookup
+    )
+
+    # helpful summary
+    gpu_peak = []
+    hbm_peak = []
+
+    for box in original_boxes:
+        ctype = ""
+        try:
+            ctype = box.chiplet_parent.get_chiplet_type()
+        except Exception:
+            pass
+
+        peak_temp = results[box.name][0]
+
+        if ctype == "GPU":
+            gpu_peak.append(peak_temp)
+        if ctype == "HBM" or str(ctype).startswith("HBM_l"):
+            hbm_peak.append(peak_temp)
+
+    if gpu_peak:
+        print(f"Peak GPU temperature (C): {max(gpu_peak):.3f}")
+    if hbm_peak:
+        print(f"Peak HBM temperature (C): {max(hbm_peak):.3f}")
+
+    print("simulator_simulate() finished")
+    return results
+
+# ZUONING END
+
 
 if __name__ == '__main__':
     therm()

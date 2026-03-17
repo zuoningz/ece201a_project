@@ -68,7 +68,7 @@ conductivity_values = {
     "EpAg": 1.6,
     "Infill_material": 19,
     "Polymer1": 675,
-    "TIM0p5": 1.0 # 0.5 # 100.0 # 
+    "TIM0p5": 5.0 # 0.5 # 100.0 # 
 }
 # EpAg is Epoxy, Silver filled used in layer_definitions.xml for bonding layers 5nm_HBM2HBM_metal.
 
@@ -313,9 +313,12 @@ def create_power_source_backside(boxes, efficiency = 0.9):
     # ps = Box(x_coord,y_coord,z_coord,width,length,height,power,stackup,0,"Power Source")
     # recursively_lift_box(boxes[0].chiplet_parent, boxes, ps.height)
     # boxes.append(ps)
+    total_power = 0
+    for box in boxes:
+        total_power += box.power
+    
     ps = [box for box in boxes if box.chiplet_parent.get_chiplet_type() == "Power_Source"][0] # Assuming only one power source. For now, it is at bottom. backside power delivery.
-    # Piazza update: Power_Source power is set to 0 for this project version.
-    ps.power = 0.0
+    ps.power = (1 - efficiency) * total_power / efficiency
     ps.chiplet_parent.set_power(ps.power)
     # print("Power source power : " + str(ps.power))
 # dedeepyo : 25-Feb-2025 #
@@ -2052,12 +2055,22 @@ except Exception:
 
 AMBIENT_TEMP_C = 45.0
 EPS = 1e-18
-USE_PYSPICE_DEFAULT = os.environ.get("THERM_USE_PYSPICE", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+
+
+def use_pyspice_by_default() -> bool:
+    """
+    Read the optional backend override from the environment.
+    Defaults to enabled to preserve the existing behavior when available.
+    """
+    return os.environ.get("THERM_USE_PYSPICE", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+USE_PYSPICE_DEFAULT = use_pyspice_by_default()
 
 
 @dataclass
@@ -2787,7 +2800,6 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
     top_heatsink_cell_count = 0
     if heatsink_box is not None and heatsink_obj is not None:
         htc = float(heatsink_obj.get("hc", 0.0))
-
         z_top = heatsink_box.end_z
         tol = 1e-9
 
@@ -2802,18 +2814,6 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
                     add_convection_to_ambient(G, cell, htc, face='top')
                     conv_count += 1
                     top_heatsink_cell_count += 1
-            if abs(cell.x0 - heatsink_box.start_x) < tol and htc > 0.0:
-                add_convection_to_ambient(G, cell, htc, face='x')
-                conv_count += 1
-            if abs(cell.x1 - heatsink_box.end_x) < tol and htc > 0.0:
-                add_convection_to_ambient(G, cell, htc, face='x')
-                conv_count += 1
-            if abs(cell.y0 - heatsink_box.start_y) < tol and htc > 0.0:
-                add_convection_to_ambient(G, cell, htc, face='y')
-                conv_count += 1
-            if abs(cell.y1 - heatsink_box.end_y) < tol and htc > 0.0:
-                add_convection_to_ambient(G, cell, htc, face='y')
-                conv_count += 1
     else:
         # fallback anchor if heatsink is absent
         weak_h = 5.0
@@ -2826,13 +2826,11 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
     print("Number of convection cells =", conv_count)
     print("Heatsink name =", heatsink_box.name if heatsink_box is not None else None)
     print("HTC =", heatsink_obj.get("hc") if heatsink_obj is not None else None)
-
     if conv_count == 0:
         raise RuntimeError(
             "Thermal network has no ambient boundary condition. "
-            "Check heatsink bind_to_ambient / hc settings."
+            "Check heatsink hc settings."
         )
-
     # small numerical stabilization
     for idx in range(num_cells):
         G[idx, idx] += 1e-12
@@ -2862,8 +2860,7 @@ def solve_thermal_system_pyspice(cells, cell_by_ijk, heatsink_box=None, heatsink
 
     for cell in cells:
         node_name = f'N{cell.idx}'
-        # PySpice current sources are oriented from the first node to the second.
-        # For thermal power injection, we want current entering the thermal node.
+        # Inject thermal power into the node so a simple 1 A / 2 ohm test gives +2 C, not -2 C.
         circuit.CurrentSource(f'P{cell.idx}', circuit.gnd, node_name, float(cell.power_w))
 
     res_count = 0
@@ -2909,41 +2906,17 @@ def solve_thermal_system_pyspice(cells, cell_by_ijk, heatsink_box=None, heatsink
         for cell in cells:
             if cell.owner_name != heatsink_box.name:
                 continue
-            if abs(cell.z1 - z_top) < tol and htc > 0.0:
-                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
-                if area_m2 > 0.0:
-                    g = htc * area_m2
-                    r_conv = 1.0 / max(g, EPS)
-                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
-                    conv_count += 1
-            if abs(cell.x0 - heatsink_box.start_x) < tol and htc > 0.0:
-                area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
-                if area_m2 > 0.0:
-                    g = htc * area_m2
-                    r_conv = 1.0 / max(g, EPS)
-                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
-                    conv_count += 1
-            if abs(cell.x1 - heatsink_box.end_x) < tol and htc > 0.0:
-                area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
-                if area_m2 > 0.0:
-                    g = htc * area_m2
-                    r_conv = 1.0 / max(g, EPS)
-                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
-                    conv_count += 1
-            if abs(cell.y0 - heatsink_box.start_y) < tol and htc > 0.0:
-                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
-                if area_m2 > 0.0:
-                    g = htc * area_m2
-                    r_conv = 1.0 / max(g, EPS)
-                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
-                    conv_count += 1
-            if abs(cell.y1 - heatsink_box.end_y) < tol and htc > 0.0:
-                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
-                if area_m2 > 0.0:
-                    g = htc * area_m2
-                    r_conv = 1.0 / max(g, EPS)
-                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
-                    conv_count += 1
+            if abs(cell.z1 - z_top) >= tol or htc <= 0.0:
+                continue
+
+            area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
+            if area_m2 <= 0.0:
+                continue
+
+            g = htc * area_m2
+            r_conv = 1.0 / max(g, EPS)
+            circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+            conv_count += 1
     else:
         weak_h = 5.0
         for cell in cells:
@@ -2962,7 +2935,7 @@ def solve_thermal_system_pyspice(cells, cell_by_ijk, heatsink_box=None, heatsink
     if conv_count == 0:
         raise RuntimeError(
             "PySpice thermal network has no ambient boundary condition. "
-            "Check heatsink bind_to_ambient / hc settings."
+            "Check heatsink hc settings."
         )
 
     simulator = circuit.simulator(
@@ -3067,8 +3040,7 @@ def simulator_simulate(
     layers=None
 ):
     """
-    Fine-grained thermal simulation using a direct sparse thermal solve.
-    PySpice remains available as an optional cross-check.
+    Fine-grained thermal simulation using PySpice.
 
     Inputs:
       boxes            : original input boxes (the ones required by project output)

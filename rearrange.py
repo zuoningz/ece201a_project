@@ -1,4 +1,14 @@
-from sortedcontainers import SortedList
+try:
+    from sortedcontainers import SortedList
+except Exception:
+    class SortedList(list):
+        def __init__(self, iterable=(), key=None):
+            self._key = key or (lambda x: x)
+            super().__init__(sorted(iterable, key=self._key))
+
+        def add(self, value):
+            super().append(value)
+            self.sort(key=self._key)
 import sys
 import random
 # deep copy

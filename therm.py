@@ -8,7 +8,6 @@ import yaml
 import sys
 import math
 import matplotlib.pyplot as plt
-import seaborn as sns
 import xml.etree.ElementTree as ET
 from thermal_simulators.factory import SimulatorFactory
 from mpl_toolkits.mplot3d import Axes3D
@@ -24,18 +23,29 @@ import pickle
 import os
 import subprocess
 import re
+import shutil
 from collections import defaultdict
 
 import numpy as np
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
+try:
+    import seaborn as sns
+except Exception:
+    sns = None
+
+try:
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import r2_score
+except Exception:
+    LinearRegression = None
+    r2_score = None
 
 import re
 from pathlib import Path
 from typing import List, Tuple
 import csv
 
-sns.set()
+if sns is not None:
+    sns.set()
 
 # how many times*min_dist should we move
 MOVE_MULTIPLIER = 1
@@ -303,12 +313,9 @@ def create_power_source_backside(boxes, efficiency = 0.9):
     # ps = Box(x_coord,y_coord,z_coord,width,length,height,power,stackup,0,"Power Source")
     # recursively_lift_box(boxes[0].chiplet_parent, boxes, ps.height)
     # boxes.append(ps)
-    total_power = 0
-    for box in boxes:
-        total_power += box.power
-    
     ps = [box for box in boxes if box.chiplet_parent.get_chiplet_type() == "Power_Source"][0] # Assuming only one power source. For now, it is at bottom. backside power delivery.
-    ps.power = (1 - efficiency) * total_power / efficiency
+    # Piazza update: Power_Source power is set to 0 for this project version.
+    ps.power = 0.0
     ps.chiplet_parent.set_power(ps.power)
     # print("Power source power : " + str(ps.power))
 # dedeepyo : 25-Feb-2025 #
@@ -1596,6 +1603,16 @@ def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_na
     heatsink_obj = create_heat_sink(box_list = boxes, heatsink_list = heatsink_list, heatsink_name = heatsink_name, min_TIM_height = min_TIM_height, scale_factor_x = 0, scale_factor_y = 0, area_scale_factor = 1)
     create_power_source_backside(boxes) #
     power_dict = initialize_power_dict_values(boxes)
+    
+    # DEBUG: Print actual power values being used
+    print("\n===== POWER CONFIGURATION =====")
+    print("Power dict:", power_dict)
+    for box in boxes:
+        if box.chiplet_parent.get_chiplet_type() == "GPU":
+            print(f"GPU power from box: {box.power} W")
+        elif box.chiplet_parent.get_chiplet_type() == "HBM":
+            print(f"HBM power from box: {box.power} W")
+    print("================================\n")
 
     # print("After creating bonding, TIM and heatsink:")
     # for box in boxes:
@@ -1653,44 +1670,49 @@ def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_na
         
         is_repeat = is_repeat # False # False # True if the simulation is repeated with different powers, False if only one simulation is run.
         results = simulator_simulate(boxes, bonding_box_list, TIM_boxes, heatsink_obj = heatsink_obj, heatsink_list = heatsink_list, heatsink_name = heatsink_name, bonding_list = bonding_list, bonding_name_type_dict = bonding_name_type_dict, is_repeat = is_repeat,  min_TIM_height = min_TIM_height, power_dict = power_dict, anemoi_parameter_ID = anemoi_parameter_ID, layers = layers) #
+        
+        # Print hierarchical temperature statistics
+        print("\n===== THERMAL ANALYSIS RESULTS =====\n")
+        print_chiplet_temperatures(chiplet_tree[0], results, boxes)
+        print("\n=====================================\n")
+        
         print("\n===== DEBUG: OBJECT STRUCTURES =====")
 
 
-        if boxes:
-            print("\nBOX example:")
-            print(type(boxes[0]))
-            print(vars(boxes[0]))
+        # if boxes:
+        #     print("\nBOX example:")
+        #     print(type(boxes[0]))
+        #     print(vars(boxes[0]))
 
-        if bonding_box_list:
-            print("\nBONDING BOX example:")
-            print(type(bonding_box_list[0]))
-            print(vars(bonding_box_list[0]))
+        # if bonding_box_list:
+        #     print("\nBONDING BOX example:")
+        #     print(type(bonding_box_list[0]))
+        #     print(vars(bonding_box_list[0]))
 
-        if TIM_boxes:
-            print("\nTIM BOX example:")
-            print(type(TIM_boxes[0]))
-            print(vars(TIM_boxes[0]))
+        # if TIM_boxes:
+        #     print("\nTIM BOX example:")
+        #     print(type(TIM_boxes[0]))
+        #     print(vars(TIM_boxes[0]))
 
-        if heatsink_obj:
-            print("\nHEATSINK example:")
-            print(type(heatsink_obj))
-            print(heatsink_obj)
+        # if heatsink_obj:
+        #     print("\nHEATSINK example:")
+        #     print(type(heatsink_obj))
+        #     print(heatsink_obj)
 
-        if layers:
-            print("\nLAYER example:")
-            print(type(layers[0]))
-            print(vars(layers[0]))
+        # if layers:
+        #     print("\nLAYER example:")
+        #     print(type(layers[0]))
+        #     print(vars(layers[0]))
 
         print("\n====================================\n")
         
-        print("Simulation results:")
-        for name, vals in results.items():
-            print(name, "->", vals)
+        # print("Simulation results:")
+        # for name, vals in results.items():
+        #     print(name, "->", vals)
 
         simulation_end_time = time.time()
         print("Simulation finished at ", simulation_end_time)
         print("Time taken for simulation: ", simulation_end_time - simulation_start_time)
-        return #TODO: Comment out later
 
     # dedeepyo : 4-Jun-25
 
@@ -1817,6 +1839,9 @@ def read_data(filename):
     return np.array(data)
 
 def interpolate_and_report(data, col2_values, file_handle, system_name, HTC, TIM_conductivity, infill_conductivity, underfill_conductivity, HBM_stack_height, dummy_Si):
+    if LinearRegression is None or r2_score is None:
+        raise ImportError("scikit-learn is required for interpolate_and_report()")
+
     slope_intercept_dict = {}
     for val in col2_values:
         slope_intercept_dict[val] = {'peak_GPU_temp': (0.0, 0.0), 'peak_HBM_temp': (0.0, 0.0)}
@@ -2025,8 +2050,14 @@ try:
 except Exception:
     SCIPY_AVAILABLE = False
 
-AMBIENT_TEMP_C = 25.0
+AMBIENT_TEMP_C = 45.0
 EPS = 1e-18
+USE_PYSPICE_DEFAULT = os.environ.get("THERM_USE_PYSPICE", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 @dataclass
@@ -2417,6 +2448,90 @@ def make_heatsink_box(heatsink_obj):
     return Box(x, y, z, dx, dy, dz, 0.0, f"1:{material}", 0.0, name)
 
 
+def get_box_chiplet_type(box) -> str:
+    """
+    Best-effort extraction of the chiplet type for a box.
+    """
+    try:
+        return str(box.chiplet_parent.get_chiplet_type())
+    except Exception:
+        return str(getattr(box, "name", ""))
+
+
+def is_center_plane_power_box(box) -> bool:
+    """
+    The project statement specifies center-plane power injection for GPU and HBM dies.
+    """
+    chiplet_type = get_box_chiplet_type(box)
+    return (
+        chiplet_type == "GPU" or
+        chiplet_type == "HBM" or
+        chiplet_type.startswith("HBM_l")
+    )
+
+
+def assign_cell_powers(cells):
+    """
+    Distribute each box's power onto its owned cells.
+
+    Project-specific rule:
+      - GPU / HBM boxes inject power only on the vertical center plane.
+      - Other powered boxes default to volumetric distribution.
+    """
+    cells_by_owner = defaultdict(list)
+    for cell in cells:
+        cells_by_owner[cell.owner_name].append(cell)
+
+    for owner_cells in cells_by_owner.values():
+        owner = owner_cells[0].owner_box
+        owner_power = 0.0 if owner.power is None else float(owner.power)
+
+        if abs(owner_power) <= EPS:
+            for cell in owner_cells:
+                cell.power_w = 0.0
+            continue
+
+        if is_center_plane_power_box(owner):
+            z_center = 0.5 * (owner.start_z + owner.end_z)
+            selected_cells = [
+                cell for cell in owner_cells
+                if cell.z0 - 1e-9 <= z_center <= cell.z1 + 1e-9
+            ]
+
+            if not selected_cells:
+                best_distance = min(
+                    abs(0.5 * (cell.z0 + cell.z1) - z_center)
+                    for cell in owner_cells
+                )
+                selected_cells = [
+                    cell for cell in owner_cells
+                    if abs(0.5 * (cell.z0 + cell.z1) - z_center) <= best_distance + 1e-12
+                ]
+
+            weights = [
+                max(mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm), EPS)
+                for cell in selected_cells
+            ]
+            weight_total = max(sum(weights), EPS)
+
+            for cell in owner_cells:
+                cell.power_w = 0.0
+
+            for cell, weight in zip(selected_cells, weights):
+                cell.power_w = owner_power * weight / weight_total
+        else:
+            weights = [
+                max(
+                    mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm),
+                    EPS
+                )
+                for cell in owner_cells
+            ]
+            weight_total = max(sum(weights), EPS)
+            for cell, weight in zip(owner_cells, weights):
+                cell.power_w = owner_power * weight / weight_total
+
+
 def point_inside_box(cx, cy, cz, box, tol=1e-9):
     """
     Check whether point (cx, cy, cz) lies inside box.
@@ -2535,20 +2650,7 @@ def build_voxel_grid(
                 if owner is None:
                     continue
 
-                box_volume_m3 = max(
-                    mm_to_m(owner.width) * mm_to_m(owner.length) * mm_to_m(owner.height),
-                    EPS
-                )
-                cell_volume_m3 = max(
-                    mm_to_m(dx_mm) * mm_to_m(dy_mm) * mm_to_m(dz_mm),
-                    EPS
-                )
-
                 k_eff = parse_stackup_effective_k(owner.stackup, layer_lookup)
-
-                owner_power = 0.0 if owner.power is None else float(owner.power)
-                power_density = owner_power / box_volume_m3
-                cell_power = power_density * cell_volume_m3
 
                 is_original = owner.name in original_box_names
 
@@ -2563,13 +2665,15 @@ def build_voxel_grid(
                     owner_name=owner.name,
                     owner_box=owner,
                     k_eff=float(k_eff),
-                    power_w=float(cell_power),
+                    power_w=0.0,
                     is_original_box=is_original
                 )
 
                 cells.append(cell)
                 cell_by_ijk[(i, j, k)] = cell
                 cell_idx += 1
+
+    assign_cell_powers(cells)
 
     return cells, cell_by_ijk, x_lines, y_lines, z_lines
 
@@ -2679,16 +2783,10 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
 
     # convection from exposed top of heatsink
     conv_count = 0
+    heatsink_cell_count = 0
+    top_heatsink_cell_count = 0
     if heatsink_box is not None and heatsink_obj is not None:
         htc = float(heatsink_obj.get("hc", 0.0))
-        bind_to_ambient = heatsink_obj.get("bound", True)
-
-        # if "bound" somehow came in as string, normalize it
-        if isinstance(bind_to_ambient, str):
-            bind_to_ambient = bind_to_ambient.strip().lower() == "true"
-
-        heatsink_cell_count = 0
-        top_heatsink_cell_count = 0
 
         z_top = heatsink_box.end_z
         tol = 1e-9
@@ -2704,6 +2802,18 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
                     add_convection_to_ambient(G, cell, htc, face='top')
                     conv_count += 1
                     top_heatsink_cell_count += 1
+            if abs(cell.x0 - heatsink_box.start_x) < tol and htc > 0.0:
+                add_convection_to_ambient(G, cell, htc, face='x')
+                conv_count += 1
+            if abs(cell.x1 - heatsink_box.end_x) < tol and htc > 0.0:
+                add_convection_to_ambient(G, cell, htc, face='x')
+                conv_count += 1
+            if abs(cell.y0 - heatsink_box.start_y) < tol and htc > 0.0:
+                add_convection_to_ambient(G, cell, htc, face='y')
+                conv_count += 1
+            if abs(cell.y1 - heatsink_box.end_y) < tol and htc > 0.0:
+                add_convection_to_ambient(G, cell, htc, face='y')
+                conv_count += 1
     else:
         # fallback anchor if heatsink is absent
         weak_h = 5.0
@@ -2716,6 +2826,13 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
     print("Number of convection cells =", conv_count)
     print("Heatsink name =", heatsink_box.name if heatsink_box is not None else None)
     print("HTC =", heatsink_obj.get("hc") if heatsink_obj is not None else None)
+
+    if conv_count == 0:
+        raise RuntimeError(
+            "Thermal network has no ambient boundary condition. "
+            "Check heatsink bind_to_ambient / hc settings."
+        )
+
     # small numerical stabilization
     for idx in range(num_cells):
         G[idx, idx] += 1e-12
@@ -2733,6 +2850,133 @@ def solve_thermal_system(num_cells, cells, cell_by_ijk, heatsink_box=None, heats
 
     T = dT + AMBIENT_TEMP_C
     return T
+
+
+def solve_thermal_system_pyspice(cells, cell_by_ijk, heatsink_box=None, heatsink_obj=None):
+    """
+    Solve the thermal network using a real PySpice operating-point analysis.
+    """
+    from PySpice.Spice.Netlist import Circuit
+
+    circuit = Circuit('Thermal Network')
+
+    for cell in cells:
+        node_name = f'N{cell.idx}'
+        # PySpice current sources are oriented from the first node to the second.
+        # For thermal power injection, we want current entering the thermal node.
+        circuit.CurrentSource(f'P{cell.idx}', circuit.gnd, node_name, float(cell.power_w))
+
+    res_count = 0
+    for cell in cells:
+        i, j, k = cell.i, cell.j, cell.k
+        for axis, di, dj, dk in [('x', 1, 0, 0), ('y', 0, 1, 0), ('z', 0, 0, 1)]:
+            nbr = cell_by_ijk.get((i + di, j + dj, k + dk), None)
+            if nbr is None or cell.idx >= nbr.idx:
+                continue
+
+            if axis == 'x':
+                area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
+                La = 0.5 * mm_to_m(cell.dx_mm)
+                Lb = 0.5 * mm_to_m(nbr.dx_mm)
+            elif axis == 'y':
+                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
+                La = 0.5 * mm_to_m(cell.dy_mm)
+                Lb = 0.5 * mm_to_m(nbr.dy_mm)
+            else:
+                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
+                La = 0.5 * mm_to_m(cell.dz_mm)
+                Lb = 0.5 * mm_to_m(nbr.dz_mm)
+
+            area_m2 = max(area_m2, EPS)
+            ka = max(cell.k_eff, EPS)
+            kb = max(nbr.k_eff, EPS)
+            resistance = max(La / (ka * area_m2) + Lb / (kb * area_m2), EPS)
+
+            circuit.R(
+                f'C{res_count}',
+                f'N{cell.idx}',
+                f'N{nbr.idx}',
+                resistance
+            )
+            res_count += 1
+
+    conv_count = 0
+    if heatsink_box is not None and heatsink_obj is not None:
+        htc = float(heatsink_obj.get("hc", 0.0))
+        z_top = heatsink_box.end_z
+        tol = 1e-9
+
+        for cell in cells:
+            if cell.owner_name != heatsink_box.name:
+                continue
+            if abs(cell.z1 - z_top) < tol and htc > 0.0:
+                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
+                if area_m2 > 0.0:
+                    g = htc * area_m2
+                    r_conv = 1.0 / max(g, EPS)
+                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+                    conv_count += 1
+            if abs(cell.x0 - heatsink_box.start_x) < tol and htc > 0.0:
+                area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
+                if area_m2 > 0.0:
+                    g = htc * area_m2
+                    r_conv = 1.0 / max(g, EPS)
+                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+                    conv_count += 1
+            if abs(cell.x1 - heatsink_box.end_x) < tol and htc > 0.0:
+                area_m2 = mm_to_m(cell.dy_mm) * mm_to_m(cell.dz_mm)
+                if area_m2 > 0.0:
+                    g = htc * area_m2
+                    r_conv = 1.0 / max(g, EPS)
+                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+                    conv_count += 1
+            if abs(cell.y0 - heatsink_box.start_y) < tol and htc > 0.0:
+                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
+                if area_m2 > 0.0:
+                    g = htc * area_m2
+                    r_conv = 1.0 / max(g, EPS)
+                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+                    conv_count += 1
+            if abs(cell.y1 - heatsink_box.end_y) < tol and htc > 0.0:
+                area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dz_mm)
+                if area_m2 > 0.0:
+                    g = htc * area_m2
+                    r_conv = 1.0 / max(g, EPS)
+                    circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+                    conv_count += 1
+    else:
+        weak_h = 5.0
+        for cell in cells:
+            if cell_by_ijk.get((cell.i, cell.j, cell.k + 1), None) is not None:
+                continue
+
+            area_m2 = mm_to_m(cell.dx_mm) * mm_to_m(cell.dy_mm)
+            if area_m2 <= 0.0:
+                continue
+
+            g = weak_h * area_m2
+            r_conv = 1.0 / max(g, EPS)
+            circuit.R(f'V{conv_count}', f'N{cell.idx}', circuit.gnd, r_conv)
+            conv_count += 1
+
+    if conv_count == 0:
+        raise RuntimeError(
+            "PySpice thermal network has no ambient boundary condition. "
+            "Check heatsink bind_to_ambient / hc settings."
+        )
+
+    simulator = circuit.simulator(
+        temperature=AMBIENT_TEMP_C,
+        nominal_temperature=AMBIENT_TEMP_C
+    )
+    analysis = simulator.operating_point()
+
+    temperatures = np.zeros(len(cells), dtype=float)
+    for cell in cells:
+        node_name = f'N{cell.idx}'
+        temperatures[cell.idx] = float(analysis[node_name]) + AMBIENT_TEMP_C
+
+    return temperatures
 
 
 def compute_box_directional_resistances(box, layer_lookup):
@@ -2823,7 +3067,8 @@ def simulator_simulate(
     layers=None
 ):
     """
-    Fine-grained thermal simulation.
+    Fine-grained thermal simulation using a direct sparse thermal solve.
+    PySpice remains available as an optional cross-check.
 
     Inputs:
       boxes            : original input boxes (the ones required by project output)
@@ -2841,9 +3086,8 @@ def simulator_simulate(
     print("Entering simulator_simulate()")
 
     # Grid resolution
-    # You can tune these if runtime is too high or too low.
-    XY_PITCH_MM = 1.0
-    Z_PITCH_MM = 0.1
+    XY_PITCH_MM = 4.0
+    Z_PITCH_MM = 0.4
 
     original_boxes = list(boxes)
     original_box_names = set(b.name for b in original_boxes)
@@ -2858,21 +3102,7 @@ def simulator_simulate(
         heatsink_box = make_heatsink_box(heatsink_obj)
         solver_boxes.append(heatsink_box)
     
-    print("heatsink_obj =", heatsink_obj)
-    print("heatsink_box vars =", vars(heatsink_box))
-    print("heatsink start_z =", heatsink_box.start_z)
-    print("heatsink end_z   =", heatsink_box.end_z)
-    print("heatsink height  =", heatsink_box.height)
-    print("heatsink width   =", heatsink_box.width)
-    print("heatsink length  =", heatsink_box.length)
-
-    print("max original end_z =", max(b.end_z for b in boxes))
-    print("max solver end_z   =", max(b.end_z for b in solver_boxes))
-
-    
     layer_lookup = build_layer_lookup(layers)
-    print(f"build_layer_lookup, layers= {layer_lookup }")
-    print("k_eff =", parse_stackup_effective_k(boxes[0].stackup, layer_lookup))
 
     print(f"Original boxes      : {len(original_boxes)}")
     print(f"Bonding boxes       : {len(bonding_box_list)}")
@@ -2880,7 +3110,6 @@ def simulator_simulate(
     print(f"Solver boxes total  : {len(solver_boxes)}")
     print(f"XY pitch (mm)       : {XY_PITCH_MM}")
     print(f"Z pitch (mm)        : {Z_PITCH_MM}")
-    print(f"SciPy available     : {SCIPY_AVAILABLE}")
 
     # Build voxel grid
     t0 = time.time()
@@ -2893,30 +3122,40 @@ def simulator_simulate(
     )
     t1 = time.time()
 
-    if heatsink_box is not None:
-        heatsink_voxels = [c for c in cells if c.owner_name == heatsink_box.name]
-        print("Total heatsink voxels =", len(heatsink_voxels))
-
-        # print a few z-values near heatsink
-        print("heatsink z-range =", heatsink_box.start_z, heatsink_box.end_z)
-        z_near = [z for z in z_lines if heatsink_box.start_z - 0.2 <= z <= heatsink_box.end_z + 0.2]
-        print("z lines near heatsink =", z_near[:30])
-
     print(f"Voxel cells built   : {len(cells)}")
     print(f"Grid build time (s) : {t1 - t0:.3f}")
     print("Total voxel power =", sum(c.power_w for c in cells))
 
-    # Solve temperatures
-    temperatures = solve_thermal_system(
-        num_cells=len(cells),
-        cells=cells,
-        cell_by_ijk=cell_by_ijk,
-        heatsink_box=heatsink_box,
-        heatsink_obj=heatsink_obj
-    )
-    t2 = time.time()
+    if USE_PYSPICE_DEFAULT:
+        print("Running PySpice DC operating point analysis...")
+        try:
+            temperatures = solve_thermal_system_pyspice(
+                cells=cells,
+                cell_by_ijk=cell_by_ijk,
+                heatsink_box=heatsink_box,
+                heatsink_obj=heatsink_obj
+            )
+        except Exception as e:
+            print(f"WARNING: PySpice execution failed ({e}); using internal matrix solver")
+            temperatures = solve_thermal_system(
+                num_cells=len(cells),
+                cells=cells,
+                cell_by_ijk=cell_by_ijk,
+                heatsink_box=heatsink_box,
+                heatsink_obj=heatsink_obj
+            )
+    else:
+        print("Running internal sparse thermal solve...")
+        temperatures = solve_thermal_system(
+            num_cells=len(cells),
+            cells=cells,
+            cell_by_ijk=cell_by_ijk,
+            heatsink_box=heatsink_box,
+            heatsink_obj=heatsink_obj
+        )
 
-    print(f"Solve time (s)      : {t2 - t1:.3f}")
+    t2 = time.time()
+    print(f"Thermal solve time (s): {t2 - t1:.3f}")
 
     # Aggregate back to original boxes only
     results = aggregate_results(
@@ -2953,6 +3192,91 @@ def simulator_simulate(
     return results
 
 # ZUONING END
+
+
+def print_chiplet_temperatures(chiplet_tree_root, results_dict, original_boxes):
+    """
+    Traverse the chiplet hierarchy and print mean and maximum temperatures for each chiplet.
+    
+    Args:
+        chiplet_tree_root: Root chiplet of the hierarchy
+        results_dict: Dictionary from simulator_simulate with temperatures {box_name: (peak, avg, ...)}
+        original_boxes: List of original Box objects
+    """
+    
+    # Build a mapping from box name to chiplet for easier lookup
+    box_name_to_chiplet = {}
+    
+    def map_boxes_to_chiplet(chiplet):
+        box = chiplet.get_box_representation()
+        if box:
+            box_name_to_chiplet[box.name] = chiplet
+        for child in chiplet.get_child_chiplets():
+            map_boxes_to_chiplet(child)
+    
+    map_boxes_to_chiplet(chiplet_tree_root)
+    
+    # Calculate mean temperature of entire system
+    total_weighted_temp = 0.0
+    total_volume = 0.0
+    
+    for box in original_boxes:
+        if box.name in results_dict:
+            peak_temp, avg_temp, _, _, _ = results_dict[box.name]
+            volume = box.width * box.length * box.height
+            total_weighted_temp += avg_temp * volume
+            total_volume += volume
+    
+    if total_volume > 0:
+        system_mean_temp = total_weighted_temp / total_volume
+        print(f"Mean temperature of entire system is {system_mean_temp}")
+    
+    # Recursively print temperatures for each chiplet
+    def print_chiplet_stats(chiplet):
+        # The chiplet name already contains the full hierarchical path
+        full_path = chiplet.get_name()
+        
+        # Collect all boxes belonging to this chiplet (including descendants)
+        chiplet_boxes = []
+        
+        def collect_boxes(c):
+            box = c.get_box_representation()
+            if box and box.name in results_dict:
+                chiplet_boxes.append(box)
+            for child in c.get_child_chiplets():
+                collect_boxes(child)
+        
+        collect_boxes(chiplet)
+        
+        # Calculate statistics for this chiplet
+        if chiplet_boxes:
+            temps = []
+            weighted_sum = 0.0
+            total_vol = 0.0
+            
+            for box in chiplet_boxes:
+                peak_temp, avg_temp, _, _, _ = results_dict[box.name]
+                volume = box.width * box.length * box.height
+                
+                temps.append(peak_temp)
+                weighted_sum += avg_temp * volume
+                total_vol += volume
+            
+            if total_vol > 0:
+                mean_temp = weighted_sum / total_vol
+            else:
+                mean_temp = 0.0
+            
+            max_temp = max(temps) if temps else 0.0
+            
+            print(f"Mean temperature of {full_path} chiplet is {mean_temp} and its maximum temperature is {max_temp}")
+        
+        # Recursively process children
+        for child in chiplet.get_child_chiplets():
+            print_chiplet_stats(child)
+    
+    # Start traversal from the root
+    print_chiplet_stats(chiplet_tree_root)
 
 
 if __name__ == '__main__':

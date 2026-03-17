@@ -81,7 +81,7 @@ class AnemoiSim(ThermalSimulator):
             host='https://anemoisoftware.com/api',
             api_key={
                 # api key here. Remove if hosted online (e.g. github)!
-                'Authorization': <paste API key here!>
+                # 'Authorization': <paste API key here!>
             },
             api_key_prefix={
                 'Authorization': 'Token'

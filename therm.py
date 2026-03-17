@@ -10,7 +10,6 @@ import math
 import matplotlib.pyplot as plt
 import seaborn as sns
 import xml.etree.ElementTree as ET
-from thermal_simulators.factory import SimulatorFactory
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -23,6 +22,7 @@ from heatsink_xml_parser import *
 import pickle
 import os
 import subprocess
+import glob
 import re
 from collections import defaultdict
 
@@ -58,7 +58,7 @@ conductivity_values = {
     "EpAg": 1.6,
     "Infill_material": 19,
     "Polymer1": 675,
-    "TIM0p5": 1.0 # 0.5 # 100.0 # 
+    "TIM0p5": 5.0 # 0.5 # 100.0 # 
 }
 # EpAg is Epoxy, Silver filled used in layer_definitions.xml for bonding layers 5nm_HBM2HBM_metal.
 
@@ -663,6 +663,744 @@ def find_deepest_node(chiplet_tree):
     traverse(root, 0)
     return deepest_node
 # dedeepyo : 03-Dec-2025
+
+# code Start
+def simulator_simulate(
+    boxes,
+    bonding_box_list=None,
+    TIM_boxes=None,
+    heatsink_obj=None,
+    heatsink_list=None,
+    heatsink_name=None,
+    bonding_list=None,
+    bonding_name_type_dict=None,
+    is_repeat=False,
+    min_TIM_height=0.1,
+    power_dict=None,
+    anemoi_parameter_ID=None,
+    layers=None,
+    ambient_temp=45.0,
+    default_hc=100.0,
+):
+#use pyspice solver 
+    return _simulator_simulate_pyspice(
+        boxes=boxes,
+        bonding_box_list=bonding_box_list,
+        TIM_boxes=TIM_boxes,
+        heatsink_obj=heatsink_obj,
+        heatsink_list=heatsink_list,
+        heatsink_name=heatsink_name,
+        bonding_list=bonding_list,
+        bonding_name_type_dict=bonding_name_type_dict,
+        is_repeat=is_repeat,
+        min_TIM_height=min_TIM_height,
+        power_dict=power_dict,
+        anemoi_parameter_ID=anemoi_parameter_ID,
+        layers=layers,
+        ambient_temp=ambient_temp,
+        default_hc=default_hc,
+    )
+
+
+def _simulator_simulate_pyspice(
+    boxes,
+    bonding_box_list=None,
+    TIM_boxes=None,
+    heatsink_obj=None,
+    heatsink_list=None,
+    heatsink_name=None,
+    bonding_list=None,
+    bonding_name_type_dict=None,
+    is_repeat=False,
+    min_TIM_height=0.1,
+    power_dict=None,
+    anemoi_parameter_ID=None,
+    layers=None,
+    ambient_temp=45.0,
+    default_hc=100.0,
+):
+    # Help PySpice find libngspice when installed in a non-standard prefix
+    if "NGSPICE_LIBRARY_PATH" not in os.environ:
+        here = os.path.dirname(os.path.abspath(__file__))
+        search_roots = [
+            os.path.abspath(os.path.join(here, "..", "ngspice", "install")),
+            os.path.abspath(os.path.join(here, "..", "..", "ngspice", "install")),
+        ]
+        for root in search_roots:
+            if not os.path.isdir(root):
+                continue
+            matches = glob.glob(os.path.join(root, "**", "libngspice.so*"), recursive=True)
+            if matches:
+                os.environ["NGSPICE_LIBRARY_PATH"] = matches[0]
+                break
+    if "SPICE_LIB_DIR" not in os.environ:
+        lib_path = os.environ.get("NGSPICE_LIBRARY_PATH")
+        if lib_path:
+            for parent in Path(lib_path).parents:
+                candidate = parent / "share" / "ngspice"
+                if candidate.is_dir():
+                    os.environ["SPICE_LIB_DIR"] = str(candidate)
+                    break
+    #ensure pyspice is downloaded 
+    try:
+        from PySpice.Spice.Netlist import Circuit
+        try:
+            from PySpice.Unit import u_Ohm, u_V, u_A
+            use_units = True
+        except Exception:
+            use_units = False
+    except Exception as e:
+        raise RuntimeError(
+            "PySpice is required. Install PySpice and ensure ngspice is available."
+        ) from e
+
+    def _ohm(val):
+        return val @ u_Ohm if use_units else val
+
+    def _volt(val):
+        return val @ u_V if use_units else val
+
+    def _amp(val):
+        return val @ u_A if use_units else val
+
+    def _safe_float(x, default=None):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _is_number(x):
+        try:
+            float(x)
+            return True
+        except Exception:
+            return False
+
+    def _overlap(a0, a1, b0, b1):
+        return max(0.0, min(a1, b1) - max(a0, b0))
+
+    def _mm_to_m(x):
+        return x * 1e-3
+    mm_to_m = 1e-3
+    tol = 1e-6
+    cell_tol = 1e-9
+    # Voxel mode with auto-grid and max-cell enforcement enabled by default.
+    max_cells = 8000  # target cell budget for auto-scaling
+    # Default grid sizes (mm)
+    grid_xy_mm = 5.0
+    grid_z_mm = 0.2
+    # Lower bounds to prevent overly tiny voxels
+    min_xy_mm = 0.5
+    min_z_mm = 0.05
+
+    def _dedup_sorted(values, tol_val=1e-9):
+        if not values:
+            return []
+        values = sorted(values)
+        out = [values[0]]
+        for v in values[1:]:
+            if abs(v - out[-1]) > tol_val:
+                out.append(v)
+        return out
+
+    def _percentile(vals, p):
+        if not vals:
+            return None
+        vals = sorted(vals)
+        idx = int(round(p * (len(vals) - 1)))
+        return vals[idx]
+
+    def _build_axis_lines(solver_boxes, axis, pitch_mm):
+        if axis == "x":
+            starts = [b.start_x for b in solver_boxes]
+            ends = [b.end_x for b in solver_boxes]
+        elif axis == "y":
+            starts = [b.start_y for b in solver_boxes]
+            ends = [b.end_y for b in solver_boxes]
+        elif axis == "z":
+            starts = [b.start_z for b in solver_boxes]
+            ends = [b.end_z for b in solver_boxes]
+        else:
+            raise ValueError("axis must be x/y/z")
+
+        lo = min(starts)
+        hi = max(ends)
+
+        values = []
+        values.extend(starts)
+        values.extend(ends)
+
+        if pitch_mm is not None and pitch_mm > 0:
+            curr = math.floor(lo / pitch_mm) * pitch_mm
+            while curr <= hi + 1e-12:
+                values.append(round(curr, 9))
+                curr += pitch_mm
+
+        values.append(lo)
+        values.append(hi)
+        return _dedup_sorted(values, tol_val=cell_tol)
+
+    def _point_inside_box(cx, cy, cz, box):
+        return (
+            box.start_x - cell_tol <= cx <= box.end_x + cell_tol and
+            box.start_y - cell_tol <= cy <= box.end_y + cell_tol and
+            box.start_z - cell_tol <= cz <= box.end_z + cell_tol
+        )
+
+    def _find_owner_box(cx, cy, cz, solver_boxes):
+        candidates = []
+        for b in solver_boxes:
+            if _point_inside_box(cx, cy, cz, b):
+                vol = max(b.width * b.length * b.height, 1e-18)
+                candidates.append((vol, b))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    def _build_voxels(solver_boxes, original_box_names, xy_pitch, z_pitch):
+        x_lines = _build_axis_lines(solver_boxes, "x", xy_pitch)
+        y_lines = _build_axis_lines(solver_boxes, "y", xy_pitch)
+        z_lines = _build_axis_lines(solver_boxes, "z", z_pitch)
+
+        cells = []
+        cell_by_ijk = {}
+        idx = 0
+
+        owner_volume_m3 = {}
+        owner_power = {}
+        for b in solver_boxes:
+            vol_m3 = max(
+                _mm_to_m(b.width) * _mm_to_m(b.length) * _mm_to_m(b.height),
+                1e-18
+            )
+            owner_volume_m3[b] = vol_m3
+            owner_power[b] = _box_power(b)
+
+        for i in range(len(x_lines) - 1):
+            x0 = x_lines[i]
+            x1 = x_lines[i + 1]
+            dx = x1 - x0
+            if dx <= cell_tol:
+                continue
+
+            for j in range(len(y_lines) - 1):
+                y0 = y_lines[j]
+                y1 = y_lines[j + 1]
+                dy = y1 - y0
+                if dy <= cell_tol:
+                    continue
+
+                for k in range(len(z_lines) - 1):
+                    z0 = z_lines[k]
+                    z1 = z_lines[k + 1]
+                    dz = z1 - z0
+                    if dz <= cell_tol:
+                        continue
+
+                    cx = 0.5 * (x0 + x1)
+                    cy = 0.5 * (y0 + y1)
+                    cz = 0.5 * (z0 + z1)
+
+                    owner = _find_owner_box(cx, cy, cz, solver_boxes)
+                    if owner is None:
+                        continue
+
+                    cell_vol_m3 = max(
+                        _mm_to_m(dx) * _mm_to_m(dy) * _mm_to_m(dz),
+                        1e-18
+                    )
+                    power_density = owner_power[owner] / owner_volume_m3[owner]
+                    cell_power = power_density * cell_vol_m3
+
+                    kx, ky, kz = k_cache[owner]
+                    k_eff = (kx + ky + kz) / 3.0
+
+                    cell = {
+                        "idx": idx,
+                        "i": i,
+                        "j": j,
+                        "k": k,
+                        "dx": dx,
+                        "dy": dy,
+                        "dz": dz,
+                        "owner": owner,
+                        "owner_name": owner.name,
+                        "is_original": owner.name in original_box_names,
+                        "k_eff": k_eff,
+                        "power_w": cell_power,
+                    }
+                    cells.append(cell)
+                    cell_by_ijk[(i, j, k)] = cell
+                    idx += 1
+
+        return cells, cell_by_ijk, x_lines, y_lines, z_lines
+
+    # Build material conductivity lookup with a few aliases.
+    k_map = dict(conductivity_values)
+    if "Epoxy, Silver filled" in k_map:
+        k_map["Epoxy_Silver_filled"] = k_map["Epoxy, Silver filled"]
+    if "Si" in k_map:
+        k_map["dummySi_HBM"] = k_map["Si"]
+        k_map["dummySi"] = k_map["Si"]
+
+    layer_map = {}
+    if layers is not None:
+        for layer in layers:
+            layer_map[layer.get_name()] = {
+                "thickness": layer.get_thickness(),
+                "material": layer.get_material(),
+            }
+
+    def _material_k(name):
+        if name in k_map:
+            return k_map[name]
+        if name in layer_map:
+            mat = layer_map[name]["material"]
+            return k_map.get(mat, k_map.get("Si", 1.0))
+        return k_map.get("Si", 1.0)
+
+    def _effective_k(stackup, box_height_mm):
+        if stackup is None or str(stackup).strip() == "":
+            k = k_map.get("Si", 1.0)
+            return k, k, k
+
+        stackup_str = str(stackup).replace("Epoxy, Silver filled", "Epoxy_Silver_filled")
+        tokens = [t.strip() for t in stackup_str.split(",") if t.strip()]
+
+        layer_entries = []
+        ratio_components = []
+
+        for token in tokens:
+            parts = [p.strip() for p in token.split(":") if p.strip()]
+            if len(parts) == 0:
+                continue
+
+            if _is_number(parts[-1]):
+                ratio_val = float(parts[-1])
+                if 0.0 <= ratio_val <= 100.0:
+                    if len(parts) >= 2 and _is_number(parts[0]):
+                        mat_name = parts[1]
+                    else:
+                        mat_name = parts[0]
+                    ratio_components.append((mat_name, ratio_val))
+                    continue
+
+            if len(parts) >= 2 and _is_number(parts[0]):
+                count = float(parts[0])
+                name = parts[1]
+                if name in layer_map:
+                    thickness = count * float(layer_map[name]["thickness"])
+                    material = layer_map[name]["material"]
+                else:
+                    thickness = count
+                    material = name
+                layer_entries.append((material, thickness))
+            else:
+                name = parts[0]
+                if name in layer_map:
+                    thickness = float(layer_map[name]["thickness"])
+                    material = layer_map[name]["material"]
+                else:
+                    thickness = 1.0
+                    material = name
+                layer_entries.append((material, thickness))
+
+        if ratio_components:
+            total_ratio = sum(r for _, r in ratio_components)
+            if total_ratio <= 0:
+                total_ratio = 1.0
+            k_mix = 0.0
+            for mat, ratio in ratio_components:
+                k_mix += _material_k(mat) * (ratio / total_ratio)
+            layer_entries.append(("_MIX_", 1.0))
+            k_map["_MIX_"] = k_mix
+
+        if not layer_entries:
+            k = k_map.get("Si", 1.0)
+            return k, k, k
+
+        total_weight = sum(t for _, t in layer_entries)
+        if total_weight <= 0:
+            k = k_map.get("Si", 1.0)
+            return k, k, k
+
+        scale = box_height_mm / total_weight if box_height_mm > 0 else 1.0
+
+        total_thickness = 0.0
+        sum_k_parallel = 0.0
+        sum_t_over_k = 0.0
+
+        for material, weight in layer_entries:
+            t = weight * scale
+            k = _material_k(material)
+            if k <= 0:
+                k = 1e-6
+            total_thickness += t
+            sum_k_parallel += k * t
+            sum_t_over_k += t / k
+
+        if total_thickness <= 0:
+            k = k_map.get("Si", 1.0)
+            return k, k, k
+
+        k_parallel = sum_k_parallel / total_thickness
+        k_series = total_thickness / sum_t_over_k if sum_t_over_k > 0 else k_parallel
+        return k_parallel, k_parallel, k_series
+
+    def _box_power(bx):
+        if power_dict and getattr(bx, "chiplet_parent", None) is not None:
+            ctype = bx.chiplet_parent.get_chiplet_type()
+            if ctype == "GPU" and "GPU" in power_dict:
+                return power_dict["GPU"]
+            if ctype == "HBM" and "HBM" in power_dict:
+                return power_dict["HBM"]
+            if ctype.startswith("HBM_l") and "HBM_l" in power_dict:
+                return power_dict["HBM_l"]
+            if ctype == "Power_Source" and "Power_Source" in power_dict:
+                return power_dict["Power_Source"]
+        try:
+            return float(bx.power) if bx.power is not None else 0.0
+        except Exception:
+            return 0.0
+
+    # Build solver box list
+    all_boxes = list(boxes)
+    if bonding_box_list:
+        all_boxes.extend(bonding_box_list)
+    if TIM_boxes:
+        all_boxes.extend(TIM_boxes)
+
+    heatsink_box = None
+    hc = default_hc
+    if heatsink_obj:
+        hc = _safe_float(heatsink_obj.get("hc", hc), hc)
+        material = heatsink_obj.get("material", "Cu-Foil")
+        x = _safe_float(heatsink_obj.get("x", 0.0), 0.0)
+        y = _safe_float(heatsink_obj.get("y", 0.0), 0.0)
+        z = _safe_float(heatsink_obj.get("z", 0.0), 0.0)
+        dx = _safe_float(heatsink_obj.get("base_dx", 0.0), 0.0)
+        dy = _safe_float(heatsink_obj.get("base_dy", 0.0), 0.0)
+        dz = _safe_float(heatsink_obj.get("base_dz", 0.0), 0.0)
+        if dx > 0 and dy > 0 and dz > 0:
+            heatsink_box = Box(x, y, z, dx, dy, dz, 0.0, f"1:{material}", 0.0, "heatsink_base")
+            all_boxes.append(heatsink_box)
+
+    # Precompute conductivities for each box
+    k_cache = {}
+    for box in all_boxes:
+        k_cache[box] = _effective_k(box.stackup, box.height)
+
+    # Auto-grid estimation disabled per request. Using fixed grid_xy_mm/grid_z_mm.
+
+    def _solve_voxels_pyspice():
+        xy_pitch = grid_xy_mm
+        z_pitch = grid_z_mm
+        cells = []
+        cell_by_ijk = {}
+        x_lines = []
+        y_lines = []
+        z_lines = []
+
+        for _ in range(8):
+            cells, cell_by_ijk, x_lines, y_lines, z_lines = _build_voxels(
+                solver_boxes=all_boxes,
+                original_box_names=set(b.name for b in boxes),
+                xy_pitch=xy_pitch,
+                z_pitch=z_pitch,
+            )
+
+            if len(cells) <= max_cells:
+                break
+
+            # Coarsen grid while preserving XY:Z ratio
+            scale = (len(cells) / max_cells) ** (1.0 / 3.0)
+            scale = max(scale, 1.2)
+            xy_pitch *= scale
+            z_pitch *= scale
+
+        if len(cells) == 0:
+            return {}
+
+        # if len(cells) > max_cells:
+        #     raise RuntimeError(
+        #         f"Too many cells ({len(cells)}). "
+        #         f"Current grid XY={xy_pitch:.3f}mm Z={z_pitch:.3f}mm still exceeds limit."
+        #     )
+
+        print(f"Using voxel grid XY={xy_pitch:.3f}mm Z={z_pitch:.3f}mm, cells={len(cells)}")
+
+        circuit = Circuit("thermal_voxel_network")
+        amb_node = "n_amb"
+        circuit.V("amb", amb_node, circuit.gnd, _volt(ambient_temp))
+        res_id = 0
+        src_id = 0
+
+        def add_res(n1, n2, r_val):
+            nonlocal res_id
+            if r_val <= 0:
+                return
+            res_id += 1
+            circuit.R(res_id, n1, n2, _ohm(r_val))
+
+        def add_cur(n_plus, n_minus, i_val):
+            nonlocal src_id
+            if i_val == 0:
+                return
+            src_id += 1
+            circuit.I(src_id, n_plus, n_minus, _amp(i_val))
+
+        node_of_cell = {c["idx"]: f"n{c['idx']}" for c in cells}
+
+        # Conduction between neighboring cells
+        for cell in cells:
+            i = cell["i"]
+            j = cell["j"]
+            k = cell["k"]
+
+            nbr = cell_by_ijk.get((i + 1, j, k))
+            if nbr is not None:
+                area = _mm_to_m(cell["dy"]) * _mm_to_m(cell["dz"])
+                la = 0.5 * _mm_to_m(cell["dx"])
+                lb = 0.5 * _mm_to_m(nbr["dx"])
+                ka = max(cell["k_eff"], 1e-18)
+                kb = max(nbr["k_eff"], 1e-18)
+                r = la / (ka * area) + lb / (kb * area)
+                add_res(node_of_cell[cell["idx"]], node_of_cell[nbr["idx"]], r)
+
+            nbr = cell_by_ijk.get((i, j + 1, k))
+            if nbr is not None:
+                area = _mm_to_m(cell["dx"]) * _mm_to_m(cell["dz"])
+                la = 0.5 * _mm_to_m(cell["dy"])
+                lb = 0.5 * _mm_to_m(nbr["dy"])
+                ka = max(cell["k_eff"], 1e-18)
+                kb = max(nbr["k_eff"], 1e-18)
+                r = la / (ka * area) + lb / (kb * area)
+                add_res(node_of_cell[cell["idx"]], node_of_cell[nbr["idx"]], r)
+
+            nbr = cell_by_ijk.get((i, j, k + 1))
+            if nbr is not None:
+                area = _mm_to_m(cell["dx"]) * _mm_to_m(cell["dy"])
+                la = 0.5 * _mm_to_m(cell["dz"])
+                lb = 0.5 * _mm_to_m(nbr["dz"])
+                ka = max(cell["k_eff"], 1e-18)
+                kb = max(nbr["k_eff"], 1e-18)
+                r = la / (ka * area) + lb / (kb * area)
+                add_res(node_of_cell[cell["idx"]], node_of_cell[nbr["idx"]], r)
+
+        # Convection to ambient
+        conv_count = 0
+        if heatsink_box is not None:
+            for cell in cells:
+                if cell["owner"] is not heatsink_box:
+                    continue
+                # Top surface = no neighbor above
+                if cell_by_ijk.get((cell["i"], cell["j"], cell["k"] + 1)) is None:
+                    area = _mm_to_m(cell["dx"]) * _mm_to_m(cell["dy"])
+                    g_conv = hc * area
+                    if g_conv > 0:
+                        add_res(node_of_cell[cell["idx"]], amb_node, 1.0 / g_conv)
+                        conv_count += 1
+        else:
+            for cell in cells:
+                if cell_by_ijk.get((cell["i"], cell["j"], cell["k"] + 1)) is None:
+                    area = _mm_to_m(cell["dx"]) * _mm_to_m(cell["dy"])
+                    g_conv = hc * area
+                    if g_conv > 0:
+                        add_res(node_of_cell[cell["idx"]], amb_node, 1.0 / g_conv)
+                        conv_count += 1
+
+        if conv_count == 0:
+            add_res(node_of_cell[cells[0]["idx"]], amb_node, 1e12)
+
+        # power cells
+        for cell in cells:
+            p = cell["power_w"]
+            if p != 0:
+                add_cur(circuit.gnd, node_of_cell[cell["idx"]], p)
+
+        simulator = circuit.simulator()
+        analysis = simulator.operating_point()
+
+        cell_t = {}
+        for cell in cells:
+            node = node_of_cell[cell["idx"]]
+            try:
+                cell_t[cell["idx"]] = float(analysis.nodes[node])
+            except Exception:
+                cell_t[cell["idx"]] = ambient_temp
+
+        # Aggregate back to original boxes
+        temps_by_owner = {}
+        vols_by_owner = {}
+        for cell in cells:
+            owner = cell["owner"]
+            if owner not in boxes:
+                continue
+            vol = _mm_to_m(cell["dx"]) * _mm_to_m(cell["dy"]) * _mm_to_m(cell["dz"])
+            temps_by_owner.setdefault(owner, []).append(cell_t[cell["idx"]])
+            vols_by_owner.setdefault(owner, []).append(vol)
+
+        results = {}
+        for box in boxes:
+            temps = temps_by_owner.get(box, [])
+            vols = vols_by_owner.get(box, [])
+            if temps:
+                peak_t = max(temps)
+                vol_sum = max(sum(vols), 1e-18)
+                avg_t = sum(t * v for t, v in zip(temps, vols)) / vol_sum
+            else:
+                peak_t = ambient_temp
+                avg_t = ambient_temp
+
+            kx, ky, kz = k_cache[box]
+            w = _mm_to_m(box.width)
+            l = _mm_to_m(box.length)
+            h = _mm_to_m(box.height)
+            rx = w / (kx * l * h) if kx > 0 and l > 0 and h > 0 else float("inf")
+            ry = l / (ky * w * h) if ky > 0 and w > 0 and h > 0 else float("inf")
+            rz = h / (kz * w * l) if kz > 0 and w > 0 and l > 0 else float("inf")
+            results[box.name] = (peak_t, avg_t, rx, ry, rz)
+
+        return results
+
+    return _solve_voxels_pyspice()
+
+    # PySpice circuit
+    circuit = Circuit("thermal_network")
+    amb_node = "n_amb"
+    circuit.V("amb", amb_node, circuit.gnd, _volt(ambient_temp))
+
+    node_of_box = {box: f"n{idx}" for idx, box in enumerate(all_boxes)}
+    res_id = 0
+    src_id = 0
+
+    def add_res(n1, n2, r_val):
+        nonlocal res_id
+        if r_val <= 0:
+            return
+        res_id += 1
+        circuit.R(res_id, n1, n2, _ohm(r_val))
+
+    def add_cur(n_plus, n_minus, i_val):
+        nonlocal src_id
+        if i_val == 0:
+            return
+        src_id += 1
+        circuit.I(src_id, n_plus, n_minus, _amp(i_val))
+
+    # Conduction between adjacent boxes
+    n = len(all_boxes)
+    for i in range(n):
+        bi = all_boxes[i]
+        kxi, kyi, kzi = k_cache[bi]
+        for j in range(i + 1, n):
+            bj = all_boxes[j]
+            kxj, kyj, kzj = k_cache[bj]
+
+            # X adjacency
+            if abs(bi.end_x - bj.start_x) <= tol or abs(bj.end_x - bi.start_x) <= tol:
+                oy = _overlap(bi.start_y, bi.end_y, bj.start_y, bj.end_y)
+                oz = _overlap(bi.start_z, bi.end_z, bj.start_z, bj.end_z)
+                if oy > tol and oz > tol:
+                    area = (oy * oz) * (mm_to_m ** 2)
+                    dx1 = (bi.width * 0.5) * mm_to_m
+                    dx2 = (bj.width * 0.5) * mm_to_m
+                    r = dx1 / (kxi * area) + dx2 / (kxj * area)
+                    if r > 0:
+                        add_res(node_of_box[bi], node_of_box[bj], r)
+
+            # Y adjacency
+            if abs(bi.end_y - bj.start_y) <= tol or abs(bj.end_y - bi.start_y) <= tol:
+                ox = _overlap(bi.start_x, bi.end_x, bj.start_x, bj.end_x)
+                oz = _overlap(bi.start_z, bi.end_z, bj.start_z, bj.end_z)
+                if ox > tol and oz > tol:
+                    area = (ox * oz) * (mm_to_m ** 2)
+                    dy1 = (bi.length * 0.5) * mm_to_m
+                    dy2 = (bj.length * 0.5) * mm_to_m
+                    r = dy1 / (kyi * area) + dy2 / (kyj * area)
+                    if r > 0:
+                        add_res(node_of_box[bi], node_of_box[bj], r)
+
+            # Z adjacency
+            if abs(bi.end_z - bj.start_z) <= tol or abs(bj.end_z - bi.start_z) <= tol:
+                ox = _overlap(bi.start_x, bi.end_x, bj.start_x, bj.end_x)
+                oy = _overlap(bi.start_y, bi.end_y, bj.start_y, bj.end_y)
+                if ox > tol and oy > tol:
+                    area = (ox * oy) * (mm_to_m ** 2)
+                    dz1 = (bi.height * 0.5) * mm_to_m
+                    dz2 = (bj.height * 0.5) * mm_to_m
+                    r = dz1 / (kzi * area) + dz2 / (kzj * area)
+                    if r > 0:
+                        add_res(node_of_box[bi], node_of_box[bj], r)
+
+    # Convection to ambient
+    conv_count = 0
+    if heatsink_box is not None:
+        area = heatsink_box.width * heatsink_box.length * (mm_to_m ** 2)
+        g_conv = hc * area
+        if g_conv > 0:
+            add_res(node_of_box[heatsink_box], amb_node, 1.0 / g_conv)
+            conv_count += 1
+    else:
+        for box in all_boxes:
+            top_area = box.width * box.length
+            if top_area <= 0:
+                continue
+            covered = 0.0
+            for other in all_boxes:
+                if other is box:
+                    continue
+                if abs(other.start_z - box.end_z) <= tol:
+                    ox = _overlap(box.start_x, box.end_x, other.start_x, other.end_x)
+                    oy = _overlap(box.start_y, box.end_y, other.start_y, other.end_y)
+                    if ox > tol and oy > tol:
+                        covered += ox * oy
+            exposed = max(0.0, top_area - covered)
+            if exposed > tol:
+                area = exposed * (mm_to_m ** 2)
+                g_conv = hc * area
+                if g_conv > 0:
+                    add_res(node_of_box[box], amb_node, 1.0 / g_conv)
+                    conv_count += 1
+
+    if conv_count == 0:
+        add_res(node_of_box[all_boxes[0]], amb_node, 1e12)
+
+    # Power sources (current injections from ground to node)
+    for box in all_boxes:
+        p = _box_power(box)
+        if p != 0:
+            add_cur(circuit.gnd, node_of_box[box], p)
+
+    # Solve operating point
+    simulator = circuit.simulator()
+    analysis = simulator.operating_point()
+
+    # Extract temperatures
+    temps = {}
+    for box in all_boxes:
+        node = node_of_box[box]
+        try:
+            temps[box] = float(analysis.nodes[node])
+        except Exception:
+            # fallback: if node missing, use ambient
+            temps[box] = ambient_temp
+
+    # Build results for original boxes
+    results = {}
+    for box in boxes:
+        kx, ky, kz = k_cache[box]
+        w = box.width * mm_to_m
+        l = box.length * mm_to_m
+        h = box.height * mm_to_m
+        rx = w / (kx * l * h) if kx > 0 and l > 0 and h > 0 else float("inf")
+        ry = l / (ky * w * h) if ky > 0 and w > 0 and h > 0 else float("inf")
+        rz = h / (kz * w * l) if kz > 0 and w > 0 and l > 0 else float("inf")
+        temp = temps.get(box, ambient_temp)
+        results[box.name] = (temp, temp, rx, ry, rz)
+
+    return results
 
 @click.command("standalone")
 @click.option('--therm_conf', help='The thermal config file')
@@ -1594,7 +2332,7 @@ def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_na
     bonding_box_list = create_all_bonding(box_list = boxes, name_type_dict = bonding_name_type_dict, bonding_list = bonding_list) #        
     TIM_boxes = create_TIM_to_heatsink(box_list = boxes, material = "TIM0p5", min_TIM_height = min_TIM_height, system_type = system_type)
     heatsink_obj = create_heat_sink(box_list = boxes, heatsink_list = heatsink_list, heatsink_name = heatsink_name, min_TIM_height = min_TIM_height, scale_factor_x = 0, scale_factor_y = 0, area_scale_factor = 1)
-    create_power_source_backside(boxes) #
+    # create_power_source_backside(boxes) #
     power_dict = initialize_power_dict_values(boxes)
 
     # print("After creating bonding, TIM and heatsink:")
@@ -1657,6 +2395,59 @@ def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_na
         simulation_end_time = time.time()
         print("Simulation finished at ", simulation_end_time)
         print("Time taken for simulation: ", simulation_end_time - simulation_start_time)
+
+        # output
+        total_vol = 0.0
+        weighted_sum = 0.0
+        for b in boxes:
+            if b.name not in results:
+                continue
+            _, avg_t, _, _, _ = results[b.name]
+            vol = float(b.width) * float(b.length) * float(b.height)
+            if vol <= 0:
+                continue
+            total_vol += vol
+            weighted_sum += avg_t * vol
+
+        if total_vol > 0:
+            mean_system = weighted_sum / total_vol
+            print(f"Mean temperature of entire system is {mean_system}")
+
+        # summary
+        gpu_vol_sum = 0.0
+        gpu_weighted_sum = 0.0
+        gpu_max = None
+        hbm_vol_sum = 0.0
+        hbm_weighted_sum = 0.0
+        hbm_max = None
+
+        for b in boxes:
+            if b.name not in results:
+                continue
+            peak_t, avg_t, _, _, _ = results[b.name]
+            print(f"Mean temperature of {b.name} chiplet is {avg_t} and its maximum temperature is {peak_t}")
+            try:
+                ctype = b.chiplet_parent.get_chiplet_type()
+            except Exception:
+                ctype = ""
+            vol = float(b.width) * float(b.length) * float(b.height)
+            if vol <= 0:
+                continue
+            if ctype == "GPU":
+                gpu_vol_sum += vol
+                gpu_weighted_sum += avg_t * vol
+                gpu_max = peak_t if gpu_max is None else max(gpu_max, peak_t)
+            if ctype == "HBM" or str(ctype).startswith("HBM_l"):
+                hbm_vol_sum += vol
+                hbm_weighted_sum += avg_t * vol
+                hbm_max = peak_t if hbm_max is None else max(hbm_max, peak_t)
+
+        if gpu_vol_sum > 0 and gpu_max is not None:
+            gpu_avg = gpu_weighted_sum / gpu_vol_sum
+            print(f"GPU average temperature is {gpu_avg} and peak temperature is {gpu_max}")
+        if hbm_vol_sum > 0 and hbm_max is not None:
+            hbm_avg = hbm_weighted_sum / hbm_vol_sum
+            print(f"HBM average temperature is {hbm_avg} and peak temperature is {hbm_max}")
         return #TODO: Comment out later
 
     # dedeepyo : 4-Jun-25
@@ -1767,8 +2558,8 @@ def initialize_power_dict_values(boxes):
             power_dict["HBM"] = box.power
         elif(box.chiplet_parent.get_chiplet_type()[0:5] == "HBM_l"):
             power_dict["HBM_l"] = box.power
-        elif(box.chiplet_parent.get_chiplet_type() == "Power_Source"):
-            power_dict["Power_Source"] = box.power
+        # elif(box.chiplet_parent.get_chiplet_type() == "Power_Source"):
+        #     power_dict["Power_Source"] = box.power
     return power_dict
 
 # dedeepyo : 4-Jun-25

@@ -68,9 +68,30 @@ conductivity_values = {
     "EpAg": 1.6,
     "Infill_material": 19,
     "Polymer1": 675,
-    "TIM0p5": 5.0 # 0.5 # 100.0 # 
+    "TIM0p5": 5.0 # 0.5 # 100.0 #
 }
 # EpAg is Epoxy, Silver filled used in layer_definitions.xml for bonding layers 5nm_HBM2HBM_metal.
+
+
+def apply_runtime_conductivities(tim_cond_list, infill_cond_list, underfill_cond_list):
+    """
+    Apply the first CLI-selected conductivity from each list to the material table
+    used by the solver.
+    """
+    tim_cond = float(tim_cond_list[0]) if tim_cond_list else conductivity_values["TIM0p5"]
+    infill_cond = float(infill_cond_list[0]) if infill_cond_list else conductivity_values["Infill_material"]
+    underfill_cond = float(underfill_cond_list[0]) if underfill_cond_list else conductivity_values["Epoxy, Silver filled"]
+
+    conductivity_values["TIM0p5"] = tim_cond
+    conductivity_values["Infill_material"] = infill_cond
+    conductivity_values["Epoxy, Silver filled"] = underfill_cond
+    conductivity_values["EpAg"] = underfill_cond
+
+    print("\n===== CONDUCTIVITY CONFIGURATION =====")
+    print(f"TIM0p5 conductivity: {conductivity_values['TIM0p5']} W/(m*K)")
+    print(f"Infill conductivity: {conductivity_values['Infill_material']} W/(m*K)")
+    print(f"Underfill conductivity: {conductivity_values['Epoxy, Silver filled']} W/(m*K)")
+    print("======================================\n")
 
 class Pin():
     def __init__(self,name,parent_name):
@@ -692,6 +713,8 @@ def find_deepest_node(chiplet_tree):
 @click.option('--infill_cond_list', default = [1.6], multiple = True, help='The infill conductivity list')
 @click.option('--underfill_cond_list', default = [1.6], multiple = True, help='The underfill conductivity list')
 def therm(therm_conf, heatsink_conf, bonding_conf, heatsink, out_dir, project_name, simtype = "Anemoi", is_repeat = False, hbm_stack_height = 1, system_type = "2p5D", dummy_si = False, tim_cond_list = (5, 10, 50), infill_cond_list = (1.6, 19), underfill_cond_list = (1.6, 19)):
+
+    apply_runtime_conductivities(tim_cond_list, infill_cond_list, underfill_cond_list)
 
     chiplet_tree = parse_all_chiplets(therm_conf)
     (w_top, l_top) = recursive_chiplet_sizing(chiplet_tree[0], None)
